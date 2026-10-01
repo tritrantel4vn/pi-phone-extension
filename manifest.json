@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "PI PHONE",
+  "version": "1.0.3",
+  "description": "Enterprise WebRTC Softphone Extension for PBX Portal",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_icon": "icons/logo.png",
+    "default_title": "PI PHONE"
+  },
+  "background": {
+    "service_worker": "background/index.js"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "content/index.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "notifications",
+    "sidePanel",
+    "offscreen"
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "resources": [
+        "icons/*",
+        "assets/*",
+        "*.html"
+      ]
+    }
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "windows": "Alt+Shift+P",
+        "mac": "Command+Shift+P"
+      }
+    }
+  }
+}
