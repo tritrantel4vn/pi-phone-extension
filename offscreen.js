@@ -13,8 +13,30 @@ let isInitializing = false
 const callState = {
   isRegistered: false,
   callStatus: '', // '' | 'connecting' | 'receiving' | 'answered'
+  callId: '',
   remoteNumber: '',
   callLog: null
+}
+
+function getCallId(callMeta = {}) {
+  return typeof callMeta.callId === 'string' ? callMeta.callId.trim() : ''
+}
+
+function isSameCall(remoteNumber, callId) {
+  if (callState.callId && callId) return callState.callId === callId
+  return Boolean(remoteNumber) && callState.remoteNumber === remoteNumber
+}
+
+function logCallCallback(callback, remoteNumber, callId, result = 'processing') {
+  console.log('[Offscreen][CallState]', {
+    callback,
+    result,
+    remoteNumber,
+    callId: callId || '(missing)',
+    currentStatus: callState.callStatus,
+    currentCallId: callState.callId || '(missing)',
+    currentRemoteNumber: callState.remoteNumber
+  })
 }
 
 // Audio management for ringtones and call feedback
@@ -223,10 +245,21 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
           extension: sipAccount.extension
         })
       },
-      onCallCreated: (remoteNumber) => {
+      onCallCreated: (remoteNumber, callMeta = {}) => {
+        const callId = getCallId(callMeta)
+        const sameCall = isSameCall(remoteNumber, callId)
+
+        if (sameCall && ['connecting', 'receiving', 'answered'].includes(callState.callStatus)) {
+          logCallCallback('onCallCreated', remoteNumber, callId, 'ignored-duplicate-or-regression')
+          return
+        }
+
+        logCallCallback('onCallCreated', remoteNumber, callId)
         callState.callStatus = 'connecting'
+        callState.callId = callId
         callState.remoteNumber = remoteNumber
         callState.callLog = {
+          callId,
           phoneNumber: remoteNumber,
           incoming: false,
           start: new Date().toISOString(),
@@ -240,10 +273,27 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         })
         notifyWebApp('CALL_STATE_CHANGED', { state: 'CONNECTING', remoteNumber })
       },
-      onCallAnswered: (remoteNumber) => {
+      onCallAnswered: (remoteNumber, callMeta = {}) => {
+        const callId = getCallId(callMeta)
+        if (isSameCall(remoteNumber, callId) && callState.callStatus === 'answered') {
+          logCallCallback('onCallAnswered', remoteNumber, callId, 'ignored-duplicate')
+          return
+        }
+
+        logCallCallback('onCallAnswered', remoteNumber, callId)
         callState.callStatus = 'answered'
+        callState.callId = callId || callState.callId
         callState.remoteNumber = remoteNumber
         audioManager.stopAll()
+        if (!callState.callLog) {
+          callState.callLog = {
+            callId,
+            phoneNumber: remoteNumber,
+            incoming: false,
+            start: new Date().toISOString(),
+            timestamp: Date.now()
+          }
+        }
         if (callState.callLog) {
           callState.callLog.answered = true
           callState.callLog.answerAt = new Date().toISOString()
@@ -256,21 +306,32 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         })
         notifyWebApp('CALL_STATE_CHANGED', { state: 'CONNECTED', remoteNumber })
       },
-      onCallReceived: (remoteNumber) => {
-        // Prevent duplicate trigger within short time window
-        if (callState.callStatus === 'receiving' && callState.remoteNumber === remoteNumber) {
-          console.log('[Offscreen] Duplicate onCallReceived ignored:', remoteNumber)
+      onCallReceived: (remoteNumber, callMeta = {}) => {
+        const callId = getCallId(callMeta)
+        const sameCall = isSameCall(remoteNumber, callId)
+
+        if (sameCall && ['receiving', 'answered'].includes(callState.callStatus)) {
+          logCallCallback('onCallReceived', remoteNumber, callId, 'ignored-duplicate-or-regression')
           return
         }
 
+        logCallCallback('onCallReceived', remoteNumber, callId)
         callState.callStatus = 'receiving'
+        callState.callId = callId || callState.callId
         callState.remoteNumber = remoteNumber
-        callState.callLog = {
-          phoneNumber: remoteNumber,
-          incoming: true,
-          start: new Date().toISOString(),
-          timestamp: Date.now()
-        }
+        callState.callLog = sameCall && callState.callLog
+          ? {
+            ...callState.callLog,
+            callId: callId || callState.callLog.callId,
+            incoming: true
+          }
+          : {
+            callId,
+            phoneNumber: remoteNumber,
+            incoming: true,
+            start: new Date().toISOString(),
+            timestamp: Date.now()
+          }
 
         audioManager.playRingtone()
 
@@ -289,22 +350,29 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         notifyWebApp('CALL_STATE_CHANGED', { state: 'INCOMING', remoteNumber })
       },
       onCallHangup: (remoteNumber) => {
+        const disconnectedRemoteNumber = remoteNumber || callState.remoteNumber
+        logCallCallback('onCallHangup', disconnectedRemoteNumber, callState.callId)
         audioManager.playHungup()
         const duration = callState.callLog?.connectTimestamp
           ? Math.round((Date.now() - callState.callLog.connectTimestamp) / 1000)
           : 0
 
         callState.callStatus = ''
+        callState.callId = ''
         callState.remoteNumber = ''
 
         chrome.runtime.sendMessage({ to: 'background', action: 'INCOMING_CALL_STOP' }).catch(() => { })
         broadcastToExtension('CALL_STATE_CHANGED', {
           callStatus: '',
-          remoteNumber,
+          remoteNumber: disconnectedRemoteNumber,
           duration,
           callLog: callState.callLog
         })
-        notifyWebApp('CALL_STATE_CHANGED', { state: 'DISCONNECTED', remoteNumber, duration })
+        notifyWebApp('CALL_STATE_CHANGED', {
+          state: 'DISCONNECTED',
+          remoteNumber: disconnectedRemoteNumber,
+          duration
+        })
         callState.callLog = null
       }
     }
@@ -336,7 +404,6 @@ function acceptCall() {
   chrome.runtime.sendMessage({ to: 'background', action: 'INCOMING_CALL_STOP' }).catch(() => { })
   try {
     pitelSDK?.accept()
-    callState.callStatus = 'answered'
   } catch (err) {
     console.error('[Offscreen] Error accepting call:', err)
   }
@@ -351,6 +418,7 @@ function rejectCall() {
     console.error('[Offscreen] Error rejecting call:', err)
   }
   callState.callStatus = ''
+  callState.callId = ''
   callState.remoteNumber = ''
 }
 
@@ -363,6 +431,7 @@ function hangup() {
     console.error('[Offscreen] Error hanging up call:', err)
   }
   callState.callStatus = ''
+  callState.callId = ''
   callState.remoteNumber = ''
 }
 
