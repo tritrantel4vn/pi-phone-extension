@@ -13,7 +13,7 @@
     "default_title": "PI PHONE"
   },
   "background": {
-    "service_worker": "background/index.js"
+    "service_worker": "background/service-worker.js"
   },
   "side_panel": {
     "default_path": "index.html"
@@ -35,7 +35,8 @@
     "activeTab",
     "notifications",
     "sidePanel",
-    "offscreen"
+    "offscreen",
+    "alarms"
   ],
   "web_accessible_resources": [
     {
