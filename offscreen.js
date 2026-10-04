@@ -8,6 +8,15 @@ let pitelSDK = null
 let currentAccount = null
 let activeSipKey = null
 let isInitializing = false
+let currentSendDTMF = false
+let sdkGeneration = 0
+let reconnectTimer = null
+let reconnectAttempt = 0
+let registeredAt = 0
+let lastHealthCheckAt = 0
+
+const HEALTH_CHECK_INTERVAL_MS = 15000
+const RECONNECT_DELAYS_MS = [2000, 4000, 8000, 15000, 30000]
 
 // Current call state maintained in offscreen
 const callState = {
@@ -15,7 +24,9 @@ const callState = {
   callStatus: '', // '' | 'connecting' | 'receiving' | 'answered'
   callId: '',
   remoteNumber: '',
-  callLog: null
+  callLog: null,
+  duplicateCallbacks: 0,
+  answeredAt: 0
 }
 
 function getCallId(callMeta = {}) {
@@ -23,8 +34,17 @@ function getCallId(callMeta = {}) {
 }
 
 function isSameCall(remoteNumber, callId) {
+  // Some PBX/SIP flows expose a different call-id while progressing through
+  // created -> received -> answered for the same logical call. While a call is
+  // active, the remote number is therefore the more stable correlation key.
+  if (remoteNumber && callState.remoteNumber === remoteNumber) return true
   if (callState.callId && callId) return callState.callId === callId
-  return Boolean(remoteNumber) && callState.remoteNumber === remoteNumber
+  return false
+}
+
+function markDuplicateCallCallback(callback, remoteNumber, callId, result) {
+  callState.duplicateCallbacks += 1
+  logCallCallback(callback, remoteNumber, callId, result)
 }
 
 function logCallCallback(callback, remoteNumber, callId, result = 'processing') {
@@ -136,6 +156,67 @@ class OffscreenAudioManager {
 
 const audioManager = new OffscreenAudioManager()
 
+function clearReconnectTimer() {
+  if (!reconnectTimer) return
+  clearTimeout(reconnectTimer)
+  reconnectTimer = null
+}
+
+function getConnectionHealth() {
+  let transportConnected = false
+  try {
+    transportConnected = Boolean(pitelSDK?.simpleUser?.isConnected?.())
+  } catch (error) {
+    console.debug('[Offscreen][Health] Unable to inspect transport state:', error)
+  }
+  return {
+    isRegistered: callState.isRegistered,
+    transportConnected,
+    extension: currentAccount?.extension,
+    reconnectAttempt,
+    registeredAt: registeredAt || undefined,
+    checkedAt: Date.now()
+  }
+}
+
+function publishConnectionHealth() {
+  const health = getConnectionHealth()
+  lastHealthCheckAt = health.checkedAt
+  chrome.storage?.local?.set({ piPhoneConnectionHealth: health }).catch(() => {})
+  broadcastToExtension('CONNECTION_HEALTH', health)
+  return health
+}
+
+function scheduleReconnect(reason = 'unknown') {
+  if (!currentAccount || reconnectTimer || isInitializing || callState.callStatus) return
+  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)]
+  reconnectAttempt += 1
+  console.warn('[Offscreen][Reconnect] Scheduled', { reason, delay, attempt: reconnectAttempt })
+  broadcastToExtension('SIP_RECONNECTING', {
+    reason,
+    delay,
+    attempt: reconnectAttempt,
+    extension: currentAccount.extension
+  })
+  broadcastToExtension('SIP_STATE_CHANGED', {
+    ...callState,
+    isRegistered: false,
+    reconnecting: true,
+    reconnectAttempt,
+    reason
+  })
+  notifyWebApp('STATUS_CHANGED', {
+    status: 'REGISTERING',
+    extension: currentAccount.extension,
+    reason,
+    reconnectAttempt
+  })
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    initPitelSDK(currentAccount, currentSendDTMF, { force: true, reason: `reconnect:${reason}` })
+  }, delay)
+}
+
 // Broadcast state updates to Background Service Worker and Phone UI
 function broadcastToExtension(action, payload = {}) {
   // 1. Notify background
@@ -166,6 +247,8 @@ function notifyWebApp(action, data = {}) {
 }
 
 async function cleanupPitelSDK() {
+  clearReconnectTimer()
+  sdkGeneration += 1
   if (pitelSDK) {
     try {
       if (pitelSDK.simpleUser) {
@@ -183,7 +266,7 @@ async function cleanupPitelSDK() {
   broadcastToExtension('SIP_STATE_CHANGED', { ...callState })
 }
 
-async function initPitelSDK(sipAccount, sendDTMF = false) {
+async function initPitelSDK(sipAccount, sendDTMF = false, options = {}) {
   if (isInitializing) {
     console.log('[Offscreen] Init already in progress, skipping')
     return
@@ -191,12 +274,13 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
 
   if (!sipAccount || !sipAccount.extension || !sipAccount.domain) {
     console.log('[Offscreen] Invalid or empty SIP account, cleaning up')
+    currentAccount = null
     await cleanupPitelSDK()
     return
   }
 
   const currentKey = `${sipAccount.extension}@${sipAccount.domain}:${sipAccount.password || ''}`
-  if (pitelSDK && activeSipKey === currentKey) {
+  if (pitelSDK && activeSipKey === currentKey && !options.force) {
     console.log('[Offscreen] SDK already initialized for account:', currentKey)
     return
   }
@@ -205,6 +289,8 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
   console.log('[Offscreen] Initializing PitelSDK for:', sipAccount.extension, sipAccount.domain)
   callState.isRegistered = false
   currentAccount = sipAccount
+  currentSendDTMF = sendDTMF
+  let initFailed = false
 
   try {
     await cleanupPitelSDK()
@@ -225,9 +311,15 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
       dtmfUseRfc: sendDTMF,
     }
 
+    const generation = ++sdkGeneration
+
     const delegates = {
       onRegistered: () => {
+        if (generation !== sdkGeneration) return
         callState.isRegistered = true
+        reconnectAttempt = 0
+        registeredAt = Date.now()
+        clearReconnectTimer()
         console.log('[Offscreen] SIP Register Success')
         broadcastToExtension('SIP_STATE_CHANGED', { ...callState })
         notifyWebApp('STATUS_CHANGED', {
@@ -237,20 +329,28 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         })
       },
       onUnregistered: () => {
+        if (generation !== sdkGeneration) return
         callState.isRegistered = false
+        registeredAt = 0
         console.log('[Offscreen] SIP Unregistered')
         broadcastToExtension('SIP_STATE_CHANGED', { ...callState })
         notifyWebApp('STATUS_CHANGED', {
           status: 'UNREGISTERED',
           extension: sipAccount.extension
         })
+        scheduleReconnect('sip-unregistered')
       },
       onCallCreated: (remoteNumber, callMeta = {}) => {
         const callId = getCallId(callMeta)
         const sameCall = isSameCall(remoteNumber, callId)
 
         if (sameCall && ['connecting', 'receiving', 'answered'].includes(callState.callStatus)) {
-          logCallCallback('onCallCreated', remoteNumber, callId, 'ignored-duplicate-or-regression')
+          markDuplicateCallCallback(
+            'onCallCreated',
+            remoteNumber,
+            callId,
+            'ignored-duplicate-or-regression'
+          )
           return
         }
 
@@ -258,6 +358,8 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         callState.callStatus = 'connecting'
         callState.callId = callId
         callState.remoteNumber = remoteNumber
+        callState.duplicateCallbacks = 0
+        callState.answeredAt = 0
         callState.callLog = {
           callId,
           phoneNumber: remoteNumber,
@@ -276,14 +378,15 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
       onCallAnswered: (remoteNumber, callMeta = {}) => {
         const callId = getCallId(callMeta)
         if (isSameCall(remoteNumber, callId) && callState.callStatus === 'answered') {
-          logCallCallback('onCallAnswered', remoteNumber, callId, 'ignored-duplicate')
+          markDuplicateCallCallback('onCallAnswered', remoteNumber, callId, 'ignored-duplicate')
           return
         }
 
         logCallCallback('onCallAnswered', remoteNumber, callId)
         callState.callStatus = 'answered'
-        callState.callId = callId || callState.callId
+        callState.callId = callState.callId || callId
         callState.remoteNumber = remoteNumber
+        callState.answeredAt = Date.now()
         audioManager.stopAll()
         if (!callState.callLog) {
           callState.callLog = {
@@ -311,7 +414,12 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         const sameCall = isSameCall(remoteNumber, callId)
 
         if (sameCall && ['receiving', 'answered'].includes(callState.callStatus)) {
-          logCallCallback('onCallReceived', remoteNumber, callId, 'ignored-duplicate-or-regression')
+          markDuplicateCallCallback(
+            'onCallReceived',
+            remoteNumber,
+            callId,
+            'ignored-duplicate-or-regression'
+          )
           return
         }
 
@@ -351,6 +459,26 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
       },
       onCallHangup: (remoteNumber) => {
         const disconnectedRemoteNumber = remoteNumber || callState.remoteNumber
+
+        // PitelSDK does not forward the terminated session/call-id here. When
+        // duplicate callbacks were observed, a stale SIP session can terminate
+        // immediately after the active session is answered. Do not let that
+        // stale callback reset the live call and the CX inbound interaction.
+        const isLikelyStaleHangup =
+          callState.callStatus === 'answered' &&
+          callState.duplicateCallbacks > 0 &&
+          callState.answeredAt > 0 &&
+          Date.now() - callState.answeredAt < 1500
+        if (isLikelyStaleHangup) {
+          logCallCallback(
+            'onCallHangup',
+            disconnectedRemoteNumber,
+            callState.callId,
+            'ignored-stale-after-answer'
+          )
+          return
+        }
+
         logCallCallback('onCallHangup', disconnectedRemoteNumber, callState.callId)
         audioManager.playHungup()
         const duration = callState.callLog?.connectTimestamp
@@ -360,6 +488,8 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
         callState.callStatus = ''
         callState.callId = ''
         callState.remoteNumber = ''
+        callState.duplicateCallbacks = 0
+        callState.answeredAt = 0
 
         chrome.runtime.sendMessage({ to: 'background', action: 'INCOMING_CALL_STOP' }).catch(() => { })
         broadcastToExtension('CALL_STATE_CHANGED', {
@@ -381,8 +511,10 @@ async function initPitelSDK(sipAccount, sendDTMF = false) {
     activeSipKey = currentKey
   } catch (err) {
     console.error('[Offscreen] Failed to instantiate PitelSDK:', err)
+    initFailed = true
   } finally {
     isInitializing = false
+    if (initFailed) scheduleReconnect(options.reason || 'sdk-init-failed')
   }
 }
 
@@ -391,6 +523,8 @@ function makeCall(phoneNumber) {
   if (!phoneNumber) return
   callState.remoteNumber = phoneNumber
   callState.callStatus = 'connecting'
+  callState.duplicateCallbacks = 0
+  callState.answeredAt = 0
   try {
     pitelSDK?.call(phoneNumber, {})
   } catch (err) {
@@ -420,6 +554,8 @@ function rejectCall() {
   callState.callStatus = ''
   callState.callId = ''
   callState.remoteNumber = ''
+  callState.duplicateCallbacks = 0
+  callState.answeredAt = 0
 }
 
 function hangup() {
@@ -433,6 +569,8 @@ function hangup() {
   callState.callStatus = ''
   callState.callId = ''
   callState.remoteNumber = ''
+  callState.duplicateCallbacks = 0
+  callState.answeredAt = 0
 }
 
 function hold(isHold) {
@@ -507,19 +645,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       break
 
     case 'CLEANUP_SIP':
+      currentAccount = null
       cleanupPitelSDK()
       sendResponse({ status: 'CLEANED_UP' })
       break
 
-    case 'GET_STATE':
+    case 'GET_STATE': {
+      const health = publishConnectionHealth()
       sendResponse({
         isRegistered: callState.isRegistered,
         callStatus: callState.callStatus,
         remoteNumber: callState.remoteNumber,
         callLog: callState.callLog,
-        currentAccount
+        currentAccount,
+        health,
+        lastHealthCheckAt
       })
       break
+    }
+
+    case 'HEALTH_CHECK': {
+      const health = publishConnectionHealth()
+      if (
+        currentAccount &&
+        !callState.callStatus &&
+        (!health.isRegistered || !health.transportConnected)
+      ) {
+        callState.isRegistered = false
+        scheduleReconnect(
+          health.transportConnected ? 'alarm-registration-lost' : 'alarm-transport-disconnected'
+        )
+      }
+      sendResponse({ status: 'HEALTH_CHECKED', health })
+      break
+    }
 
     case 'MAKE_CALL':
       makeCall(payload?.phoneNumber)
@@ -588,6 +747,7 @@ if (typeof chrome !== 'undefined' && chrome.storage?.local) {
             initPitelSDK(newAcc, !!sendDTMF)
           }).catch(() => { })
         } else {
+          currentAccount = null
           cleanupPitelSDK()
         }
       }
@@ -599,3 +759,15 @@ if (typeof chrome !== 'undefined' && chrome.storage?.local) {
 } else {
   console.log('[Offscreen] chrome.storage is not directly accessible in this offscreen context; awaiting messages from background/UI')
 }
+
+// Offscreen documents are independent from the focused CX tab. This watchdog
+// detects silent WebSocket loss and keeps SIP registration alive while Chrome
+// is running in the background.
+setInterval(() => {
+  const health = publishConnectionHealth()
+  if (!currentAccount || callState.callStatus || isInitializing) return
+  if (!health.isRegistered || !health.transportConnected) {
+    callState.isRegistered = false
+    scheduleReconnect(health.transportConnected ? 'registration-lost' : 'transport-disconnected')
+  }
+}, HEALTH_CHECK_INTERVAL_MS)
